@@ -11,31 +11,23 @@ import torch.optim
 import torch.utils.data
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
-import resnet_icml as resnet
+# import resnet_icml as resnet
 
 from torch.utils.data import Dataset, DataLoader
 import util
 from warnings import simplefilter
 from GradualWarmupScheduler import *
 
+from resnet import resnet20 as target_resnet20
+from resnet_quant import resnet20 as quant_resnet20
 
 # ignore all future warnings
 simplefilter(action='ignore', category=FutureWarning)
 np.seterr(all='ignore')
 
-os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"   # see issue #152
-
-model_names = sorted(name for name in resnet.__dict__
-    if name.islower() and not name.startswith("__")
-                     and name.startswith("resnet")
-                     and callable(resnet.__dict__[name]))
-
-print(model_names)
-
 parser = argparse.ArgumentParser(description='Propert ResNets for CIFAR10 in pytorch')
 parser.add_argument('--arch', '-a', metavar='ARCH', default='resnet20', #'resnet56', #
-                    choices=model_names,
-                    help='model architecture: ' + ' | '.join(model_names) +
+                    help='model architecture: ' +
                          ' (default: resnet32)')
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
@@ -88,22 +80,24 @@ parser.add_argument('--save_subset', dest='save_subset', action='store_true', he
 TRAIN_NUM = 50000
 CLASS_NUM = 10
 
-
+print("hello")
 def main(subset_size=.1, greedy=0):
-
+    print("hello")
     global args, best_prec1
     args = parser.parse_args()
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+    # os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 
     print(f'--------- subset_size: {subset_size}, method: {args.ig}, moment: {args.momentum}, '
           f'lr_schedule: {args.lr_schedule}, greedy: {greedy}, stoch: {args.st_grd}, rs: {args.random_subset_size} ---------------')
-
+    print(args.lr_schedule)
     # Check the save_dir exists or not
     if not os.path.exists(args.save_dir):
         os.makedirs(args.save_dir)
 
-    model = torch.nn.DataParallel(resnet.__dict__[args.arch]())
-    model.cuda()
+
+    model = target_resnet20()
+    device='cuda'
+    model.to(device)
 
     # optionally resume from a checkpoint
     if args.resume:
@@ -216,11 +210,11 @@ def main(subset_size=.1, greedy=0):
             order = order[:B]
             print(f'Random init subset size: {args.random_subset_size}% = {B}')
 
-        model = torch.nn.DataParallel(resnet.__dict__[args.arch]())
+        model=target_resnet20()
         model.cuda()
-
+        q_model = quant_resnet20()
+        q_model.to('cpu')
         best_prec1, best_loss = 0, 1e10
-
         if args.ig == 'adam':
             print('using adam')
             optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=args.weight_decay)
@@ -238,9 +232,9 @@ def main(subset_size=.1, greedy=0):
         elif args.lr_schedule == 'step':
             lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=b)
         elif args.lr_schedule == 'mile':
-            milestones = np.array([100, 150])
+            milestones = np.array([60, 120, 160])
             lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
-                optimizer, milestones=milestones, last_epoch=args.start_epoch - 1, gamma=b)
+                optimizer, milestones=milestones, last_epoch=args.start_epoch - 1, gamma=0.2)
         elif args.lr_schedule == 'cosine':
             # lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20)
             lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
@@ -297,24 +291,45 @@ def main(subset_size=.1, greedy=0):
                         preds, labels = np.reshape(data.data, (len(data.targets), -1)), data.targets
                     else:
                         print(f'Selecting {B} elements greedily from predictions')
-                        preds, labels = predictions(indexed_loader, model)
+                        torch.save(model.state_dict(), 'cifar10_target.pt')
+                        print('Size (MB):', os.path.getsize("cifar10_target.pt")/1e6)
+                        loaded_dict_enc = torch.load('cifar10_target.pt', map_location='cpu')
+                        q_model = quant_resnet20()
+                        q_model.to('cpu')
+                        q_model.load_state_dict(loaded_dict_enc)
+                        print("loaded state dict")
+                        q_model.qconfig = torch.quantization.get_default_qconfig('fbgemm')
+                        torch.quantization.prepare(q_model, inplace=True)
+                        q_model.eval()
+                        torch.quantization.convert(q_model, inplace=True)
+                        torch.save(q_model.state_dict(), 'cifar10_target.pt')
+                        print('Size (MB):', os.path.getsize("cifar10_target.pt")/1e6)
+                        preds, labels = quantization_predictions(indexed_loader, q_model)
                         preds -= np.eye(CLASS_NUM)[labels]
-
+                    if epoch<=60:
+                        B = 50000
+                    # elif 30<epoch and epoch<=75:
+                    #     B = 25000
+                    # elif 75<epoch and epoch<=100:
+                    #     B = 10000
+                    else:
+                        B = 1000
+                    print(B)
                     fl_labels = np.zeros(np.shape(labels), dtype=int) if args.cluster_all else labels
                     subset, subset_weight, _, _, ordering_time, similarity_time = util.get_orders_and_weights(
                         B, preds, 'euclidean', smtk=args.smtk, no=0, y=fl_labels, stoch_greedy=args.st_grd,
                         equal_num=True)
 
                     weights = np.zeros(len(indexed_loader.dataset))
-                    # weights[subset] = np.ones(len(subset))
+                    weights[subset] = np.ones(len(subset))
                     subset_weight = subset_weight / np.sum(subset_weight) * len(subset_weight)
                     if args.save_subset:
                         selected_ndx[run, epoch], selected_wgt[run, epoch] = subset, subset_weight
 
                     weights[subset] = subset_weight
                     weight = torch.from_numpy(weights).float().cuda()
-                    # weight = torch.tensor(weights).cuda()
-                    # np.random.shuffle(subset)
+                    weight = torch.tensor(weights).cuda()
+                    np.random.shuffle(subset)
                     print(f'FL time: {ordering_time:.3f}, Sim time: {similarity_time:.3f}')
                     grd_time[run, epoch], sim_time[run, epoch] = ordering_time, similarity_time
 
@@ -379,7 +394,7 @@ def main(subset_size=.1, greedy=0):
             grd += f'_warm' if args.warm_start > 0 else ''
             grd += f'_feature' if args.cluster_features else ''
             grd += f'_ca' if args.cluster_all else ''
-            folder = f'/tmp/cifar10'
+            folder = f'/home/nehaprakriya/quant/resnet20/'
 
             if args.save_subset:
                 print(
@@ -406,6 +421,8 @@ def main(subset_size=.1, greedy=0):
 
     print(np.max(test_acc, 1), np.mean(np.max(test_acc, 1)),
           np.min(not_selected, 1), np.mean(np.min(not_selected, 1)))
+
+
 
 
 def train(train_loader, model, criterion, optimizer, epoch, weight=None):
@@ -438,7 +455,7 @@ def train(train_loader, model, criterion, optimizer, epoch, weight=None):
         # compute output
         output = model(input_var)
         loss = criterion(output, target_var)
-        loss = (loss * weight[idx.long()]).mean()  # (Note)
+        loss = (loss).mean()  # (Note)
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
@@ -542,6 +559,20 @@ class AverageMeter(object):
         self.count += n
         self.avg = self.sum / self.count
 
+# add a function for quant predictions
+
+def quant_predictions(loader, model):
+    model.eval()
+    preds=numpy.zeros(TRAIN_NUM, CLASS_NUM)
+    labels=numpy.zeros(TRAIN_NUM, dtype=torch.int)
+    with torch.no_grad():
+        for i, (input, target, idx) in enumerate(loader):
+            output = model(input)
+            preds[idx, :] = nn.Softmax(dim=1)(output)
+    return preds
+
+
+
 
 def predictions(loader, model):
     """
@@ -575,6 +606,17 @@ def predictions(loader, model):
             #           .format(i, len(loader), batch_time=batch_time))
 
     return preds.cpu().data.numpy(), labels.cpu().data.numpy()
+
+def quantization_predictions(loader, model):
+    model.to('cpu')
+    model.eval()
+    preds = np.zeros((TRAIN_NUM, CLASS_NUM))
+    labels = np.zeros(TRAIN_NUM)
+    labels=labels.astype('int32')
+    for i, (input, target, idx) in enumerate(loader):
+        preds[idx, :] = nn.Softmax(dim=1)(model(input))
+        labels[idx] = target.int()
+    return preds, labels
 
 
 def accuracy(output, target, topk=(1,)):
